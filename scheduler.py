@@ -7,8 +7,6 @@ Original file is located at
     https://colab.research.google.com/drive/1KhTmrJkw043HKJIJ3Kz2eE3Wai_Ou-rP
 """
 
-pip install gspread oauth2client ortools
-
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import pandas as pd
@@ -195,6 +193,48 @@ def generate_schedule(employees_df, shifts_df, requests_df):
 
 # --- MODULE 3: WRITE, COMPARE, AND NOTIFY ---
 
+import os
+import smtplib
+from email.message import EmailMessage
+
+# --- NEW EMAIL FUNCTION ---
+def send_notification_email(summary_message, affected_employees, employees_df):
+    """Sends the summary message to affected employees."""
+    print("--- Preparing to Send Email Notification ---")
+    try:
+        # Get credentials from GitHub Secrets (environment variables)
+        sender_email = os.environ.get('GMAIL_ADDRESS')
+        app_password = os.environ.get('GMAIL_APP_PASSWORD')
+
+        if not sender_email or not app_password:
+            print("❌ Email credentials not found. Skipping email.")
+            return
+
+        # Find the email addresses of the affected employees
+        recipient_emails = employees_df[employees_df['Employee_Name'].isin(affected_employees)]['Email'].tolist()
+
+        if not recipient_emails:
+            print("No affected employees with emails found. Skipping email.")
+            return
+
+        # Create the email message
+        msg = EmailMessage()
+        msg.set_content(summary_message.replace('**', '')) # Remove markdown for plain text
+        msg['Subject'] = 'New Schedule Proposal Ready for Review'
+        msg['From'] = sender_email
+        msg['To'] = ", ".join(recipient_emails)
+
+        # Connect to Gmail's server and send the email
+        server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+        server.login(sender_email, app_password)
+        server.send_message(msg)
+        server.quit()
+
+        print(f"✅ Email notification sent successfully to: {', '.join(recipient_emails)}")
+
+    except Exception as e:
+        print(f"❌ Failed to send email: {e}")
+
 def update_sandbox_and_compare(sheet, solution, official_schedule_df):
     """Writes to the sandbox, compares it to the official, and generates a clean summary."""
     print("--- Updating Sandbox & Comparing Schedules ---")
@@ -258,6 +298,8 @@ def update_sandbox_and_compare(sheet, solution, official_schedule_df):
     print("\n--- Notification Summary ---")
     print(summary_message)
 
+    return summary_message, affected_employees
+
 # --- Main script execution ---
 if __name__ == '__main__':
     hr_sheet = connect_to_sheet()
@@ -267,4 +309,8 @@ if __name__ == '__main__':
         new_solution = generate_schedule(employees_df, shifts_df, requests_df)
         
         if new_solution:
-            update_sandbox_and_compare(hr_sheet, new_solution, official_schedule_df)
+            # The compare function now also returns the list of affected people
+            summary_message, affected_employees = update_sandbox_and_compare(hr_sheet, new_solution, official_schedule_df)
+
+            # Send the email
+            send_notification_email(summary_message, affected_employees, employees_df)
