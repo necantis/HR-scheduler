@@ -1,0 +1,42 @@
+# Name of the automation
+name: Daily HR Schedule Offer Run
+
+# Controls when the workflow will run
+on:
+  # Runs on a schedule (cron job)
+  schedule:
+    # This is for 17:00 CEST (15:00 UTC) every day
+    - cron: '0 15 * * *'
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  # This job sends offers in parallel for different groups
+  send-offers:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        group: [Nurses, ASSC] # Define the groups to run in parallel
+    steps:
+      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
+      - uses: actions/checkout@v3
+
+      # Sets up python for use in actions
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v3
+        with:
+          python-version: '3.9'
+
+      # Creates the credentials file from the GitHub Secret
+      - name: Create Credentials File
+        run: echo "${{ secrets.GCP_SA_KEY }}" > creds.json
+
+      # Installs the python dependencies
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      # Runs the offer sending script for the specified group
+      - name: Run the offer sending script for ${{ matrix.group }}
+        run: python send_offers.py --group ${{ matrix.group }}

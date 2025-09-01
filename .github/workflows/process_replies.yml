@@ -1,23 +1,19 @@
 # Name of the automation
-name: Daily HR Schedule Run
+name: Hourly HR Reply Processing
 
 # Controls when the workflow will run
 on:
   # Runs on a schedule (cron job)
   schedule:
-    # This is for 17:00 CEST (15:00 UTC) every day
-    - cron: '0 15 * * *'
+    # This runs at the beginning of every hour
+    - cron: '0 * * * *'
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  # This job processes email replies
+  process-replies:
     runs-on: ubuntu-latest
-
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
       # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
       - uses: actions/checkout@v3
@@ -37,7 +33,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-      
-      # Runs the main python script
-      - name: Run the scheduling script
-        run: python scheduler.py
+
+      # Runs the reply processing script
+      - name: Run the reply processing script
+        run: python process_replies.py
