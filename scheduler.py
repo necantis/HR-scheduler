@@ -81,8 +81,13 @@ if __name__ == '__main__':
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
+import calendar
 from ortools.sat.python import cp_model
+import uuid
+import imaplib
+import email
+import time
 
 # --- MODULE 1: GOOGLE SHEETS CONNECTION & DATA READING ---
 
@@ -111,7 +116,13 @@ def read_data(sheet):
     requests_ws = sheet.worksheet("Absence_Requests")
     requests_df = pd.DataFrame(requests_ws.get_all_records())
     if not requests_df.empty:
-        requests_df = requests_df.rename(columns={"Nom": "Employee_Name", "Date": "Requested_Date", "Tokens": "Tokens_Bid"})
+        # Use the new French column names "Début" and "Fin"
+        requests_df = requests_df.rename(columns={
+            "Nom": "Employee_Name",
+            "Début": "Start_Date",
+            "Fin": "End_Date",
+            "Tokens": "Tokens_Bid"
+        })
     
     official_schedule_ws = sheet.worksheet("Official_Schedule")
     official_schedule_df = pd.DataFrame(official_schedule_ws.get_all_records())
@@ -122,11 +133,29 @@ def read_data(sheet):
 
 def generate_schedule(employees_df, shifts_df, requests_df, official_schedule_df):
     """
-    Generates a schedule, using the official schedule as a hint and locking past days.
+    Generates a schedule with ALL features: dynamic dates, multi-day requests,
+    locking past days, and using the official schedule as a hint.
     """
-    print("--- Starting Schedule Generation (with hints from Official Schedule) ---")
+    print("--- Starting Schedule Generation (Full-Featured) ---")
 
-    # --- STEP 1: DATA PREPARATION (Same as before) ---
+    # --- MERGED: Dynamic Date & Multi-Day Request Logic ---
+    today = datetime.now()
+    _, num_days = calendar.monthrange(today.year, today.month)
+    today_index = today.day - 1
+    print(f"✅ Detected {num_days} days for the current month. Locking all days up to and including Day {today.day}.")
+
+    requests = []
+    if not requests_df.empty:
+        for _, row in requests_df.iterrows():
+            start_date = pd.to_datetime(row['Start_Date'], dayfirst=True)
+            end_date = pd.to_datetime(row['End_Date'], dayfirst=True)
+            num_request_days = (end_date - start_date).days + 1
+            tokens_per_day = row['Tokens_Bid'] // num_request_days if num_request_days > 0 else 0
+            for day_delta in range(num_request_days):
+                current_date = start_date + timedelta(days=day_delta)
+                requests.append((row['Employee_Name'], current_date.day, 'OFF', tokens_per_day))
+
+    # (The rest of the data prep remains the same)
     all_employees = employees_df['Employee_Name'].tolist()
     employees = {'Infirmier': [], 'Intérimaire': []}
     for _, row in employees_df.iterrows():
@@ -139,21 +168,6 @@ def generate_schedule(employees_df, shifts_df, requests_df, official_schedule_df
         applicable_days = [int(day) for day in str(row['Applicable_Days'])]
         shifts[shift_id] = {'duration': int(row['Duration_Hours'] * 100), 'role': row['Role'], 'days': applicable_days}
     
-    requests = []
-    if not requests_df.empty:
-        for _, row in requests_df.iterrows():
-            date_obj = pd.to_datetime(row['Requested_Date'], dayfirst=True)
-            day_of_month = date_obj.day
-            requests.append((row['Employee_Name'], day_of_month, 'OFF', row['Tokens_Bid']))
-
-    # --- NEW: Get today's date to lock past days ---
-    # In a real run, this is today. For testing, we can pretend it's Sept 3rd.
-    # today = datetime.now()
-    today = datetime(2025, 9, 3)
-    today_index = today.day - 1 # Day 3 corresponds to index 2
-
-    # --- STEP 2: CREATE THE MODEL AND VARIABLES (Same as before) ---
-    num_days = 30
     days_of_week = [d % 7 for d in range(num_days)]
     model = cp_model.CpModel()
     works = {}
@@ -164,26 +178,18 @@ def generate_schedule(employees_df, shifts_df, requests_df, official_schedule_df
                     if days_of_week[d] in s_info['days']:
                         works[(e, s_id, d)] = model.NewBoolVar(f'works_{e}_{s_id}_{d}')
 
-    # --- STEP 3: ADD THE CONSTRAINTS (with new locking logic) ---
-
-    # --- NEW: Lock all shifts for past and present days ---
-    print(f"Locking all shifts on and before Day {today.day}...")
+    # --- MERGED: Hard Constraint to Lock Past Days ---
     date_columns = official_schedule_df.columns[1:]
     for d in range(today_index + 1):
-        day_col = date_columns[d]
-        for _, row in official_schedule_df.iterrows():
-            shift_id = row['Shift']
-            official_employee = row[day_col]
-            if official_employee and (official_employee in all_employees):
-                # This shift must be assigned to this person
-                if (official_employee, shift_id, d) in works:
-                    model.Add(works[(official_employee, shift_id, d)] == 1)
-                # All other people cannot be assigned to this shift
-                for e in all_employees:
-                    if e != official_employee and (e, shift_id, d) in works:
-                        model.Add(works[(e, shift_id, d)] == 0)
+        if d < len(date_columns):
+            day_col = date_columns[d]
+            for _, row in official_schedule_df.iterrows():
+                shift_id, official_employee = row['Shift'], row[day_col]
+                if official_employee and (official_employee in all_employees):
+                    if (official_employee, shift_id, d) in works:
+                        model.Add(works[(official_employee, shift_id, d)] == 1)
 
-    # (All other hard constraints remain the same: coverage, 6-day work week, etc.)
+    # (All other hard constraints remain the same)
     for s_id, s_info in shifts.items():
         for d in range(num_days):
             if days_of_week[d] in s_info['days']:
@@ -196,9 +202,7 @@ def generate_schedule(employees_df, shifts_df, requests_df, official_schedule_df
                 worked_days = [works[key] for key in works if key[0] == e and d <= key[2] < d + 7]
                 model.Add(sum(worked_days) <= 6)
 
-    # --- STEP 4: DEFINE THE OBJECTIVE FUNCTION (with new hinting logic) ---
-    
-    # Primary objective: Fulfill high-token requests
+    # --- MERGED: Objective Function with Hints and Token Bids ---
     request_bonuses = []
     if requests:
       for emp, day, shift_type, penalty in requests:
@@ -210,24 +214,19 @@ def generate_schedule(employees_df, shifts_df, requests_df, official_schedule_df
               model.Add(sum(is_working_on_day) > 0).OnlyEnforceIf(request_fulfilled.Not())
               request_bonuses.append(penalty * request_fulfilled)
 
-    # --- NEW: Secondary objective: Prefer sticking to the official schedule ---
     hint_bonuses = []
-    date_columns = official_schedule_df.columns[1:] # Re-get date_columns just in case
-    for d in range(today_index + 1, num_days): # Only for future days
-        day_col = date_columns[d]
-        for _, row in official_schedule_df.iterrows():
-            shift_id = row['Shift']
-            official_employee = row[day_col]
-            if official_employee and (official_employee in all_employees):
-                if (official_employee, shift_id, d) in works:
-                    # Add a small bonus (e.g., 1 point) for keeping this assignment
-                    hint_bonuses.append(works[(official_employee, shift_id, d)])
+    for d in range(today_index + 1, num_days): # Hinting only for future days
+        if d < len(date_columns):
+            day_col = date_columns[d]
+            for _, row in official_schedule_df.iterrows():
+                shift_id, official_employee = row['Shift'], row[day_col]
+                if official_employee and (official_employee in all_employees):
+                    if (official_employee, shift_id, d) in works:
+                        hint_bonuses.append(works[(official_employee, shift_id, d)])
 
-    # Combine the objectives. Fulfilling a request (worth its token value) is much
-    # more important than sticking to the old schedule (worth 1 point).
     model.Maximize(sum(request_bonuses) + sum(hint_bonuses))
 
-    # --- STEP 5 & 6: SOLVE AND RETURN (Same as before) ---
+    # (Solver and return logic remains the same)
     solver = cp_model.CpSolver()
     status = solver.Solve(model)
 
@@ -242,56 +241,16 @@ def generate_schedule(employees_df, shifts_df, requests_df, official_schedule_df
         print("❌ No solution found.")
         return None
 
-# --- MODULE 3: WRITE, COMPARE, AND NOTIFY ---
+# --- MODULE 3: OFFER AND REPLY WORKFLOW ---
 
-import os
-import smtplib
-from email.message import EmailMessage
+def create_and_send_offers(sheet, solution, official_schedule_df, employees_df):
+    """
+    Compares the new solution to the official schedule, identifies changes,
+    creates offers, sends them via email, and logs them to the 'Offers' sheet.
+    """
+    print("--- Creating and Sending Schedule Change Offers ---")
 
-# --- NEW EMAIL FUNCTION ---
-def send_notification_email(summary_message, affected_employees, employees_df):
-    """Sends the summary message to affected employees."""
-    print("--- Preparing to Send Email Notification ---")
-    try:
-        # Get credentials from GitHub Secrets (environment variables)
-        sender_email = os.environ.get('GMAIL_ADDRESS')
-        app_password = os.environ.get('GMAIL_APP_PASSWORD')
-
-        if not sender_email or not app_password:
-            print("❌ Email credentials not found. Skipping email.")
-            return
-
-        # Find the email addresses of the affected employees
-        recipient_emails = employees_df[employees_df['Employee_Name'].isin(affected_employees)]['Email'].tolist()
-
-        if not recipient_emails:
-            print("No affected employees with emails found. Skipping email.")
-            return
-
-        # Create the email message
-        msg = EmailMessage()
-        msg.set_content(summary_message.replace('**', '')) # Remove markdown for plain text
-        msg['Subject'] = 'New Schedule Proposal Ready for Review'
-        msg['From'] = sender_email
-        msg['To'] = ", ".join(recipient_emails)
-
-        # Connect to Gmail's server and send the email
-        server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
-        server.login(sender_email, app_password)
-        server.send_message(msg)
-        server.quit()
-
-        print(f"✅ Email notification sent successfully to: {', '.join(recipient_emails)}")
-
-    except Exception as e:
-        print(f"❌ Failed to send email: {e}")
-
-def update_sandbox_and_compare(sheet, solution, official_schedule_df):
-    """Writes to the sandbox, compares it to the official, and generates a clean summary."""
-    print("--- Updating Sandbox & Comparing Schedules ---")
-    
-    sandbox_ws = sheet.worksheet("Sandbox_Schedule")
-    
+    # First, generate the new schedule DataFrame from the solution
     sandbox_data = {}
     date_columns = official_schedule_df.columns[1:]
     for col in date_columns:
@@ -300,147 +259,140 @@ def update_sandbox_and_compare(sheet, solution, official_schedule_df):
         for shift_id in official_schedule_df['Shift']:
             employee = solution.get((shift_id, day_index), '')
             sandbox_data[col].append(employee)
-            
     sandbox_df = pd.DataFrame(sandbox_data, index=official_schedule_df['Shift'])
-    
-    sandbox_ws.update([sandbox_df.columns.values.tolist()] + sandbox_df.values.tolist(), value_input_option='USER_ENTERED')
-    print("✅ Sandbox_Schedule tab has been updated.")
 
-    changes = []
-    affected_employees = set()
+    # Get email credentials
+    sender_email = os.environ.get('GMAIL_ADDRESS')
+    app_password = os.environ.get('GMAIL_APP_PASSWORD')
+    if not sender_email or not app_password:
+        print("❌ Email credentials not found. Cannot send offers.")
+        return sandbox_df # Return the sandbox_df anyway
+
+    offers_ws = sheet.worksheet("Offers")
+    offers_to_log = []
+
+    # Find all changes and create one offer per changed day per person
+    all_changes = {} # Key: employee_name, Value: list of change strings
     for day_col in date_columns:
-        day_changes = []
         for shift_id in official_schedule_df['Shift']:
-            # Use .get() to avoid errors if a column/row name is weird
             official_employee = official_schedule_df.loc[official_schedule_df['Shift'] == shift_id, day_col].iloc[0]
             sandbox_employee = sandbox_df.loc[shift_id, day_col]
-            
-            # Convert blank values to a consistent empty string for comparison
-            official_employee = '' if pd.isna(official_employee) or official_employee in ['(blank)', '...'] else official_employee
+            official_employee = '' if pd.isna(official_employee) else official_employee
             sandbox_employee = '' if pd.isna(sandbox_employee) else sandbox_employee
 
-            # --- IMPROVEMENT HERE ---
-            # Only report a change if the values are actually different
-            if str(official_employee) != str(sandbox_employee):
-                # Make the output cleaner
-                from_text = f"'{official_employee}'" if official_employee else "empty"
-                to_text = f"**'{sandbox_employee}'**" if sandbox_employee else "**empty**"
-                
-                day_changes.append(f"* **Shift {shift_id}:** Changed from {from_text} to {to_text}")
-                
-                # Add employees to the affected list
-                if official_employee: affected_employees.add(official_employee)
-                if sandbox_employee: affected_employees.add(sandbox_employee)
+            if official_employee != sandbox_employee:
+                # Change involving the official employee (shift taken away)
+                if official_employee:
+                    if official_employee not in all_changes: all_changes[official_employee] = []
+                    change_desc = f"On {day_col}, your shift '{shift_id}' was reassigned to {sandbox_employee or 'unassigned'}."
+                    all_changes[official_employee].append(change_desc)
+                # Change involving the sandbox employee (new shift assigned)
+                if sandbox_employee:
+                    if sandbox_employee not in all_changes: all_changes[sandbox_employee] = []
+                    change_desc = f"On {day_col}, you were assigned to shift '{shift_id}' (previously {official_employee or 'unassigned'})."
+                    all_changes[sandbox_employee].append(change_desc)
+
+    # Now, create and send one email per employee with all their changes
+    for employee_name, changes_list in all_changes.items():
+        offer_id = str(uuid.uuid4())
         
-        if day_changes:
-            changes.append(f"**Changes for {day_col}:**\n" + "\n".join(day_changes))
-
-    if changes:
-        summary_message = (
-            "**Subject: New Schedule Proposal Ready for Review**\n\n"
-            "A new schedule has been generated in the sandbox based on recent requests.\n\n"
-            "**Summary of Changes:**\n\n" + "\n\n".join(changes) + "\n\n"
-            f"**Affected Employees:** {', '.join(sorted(list(affected_employees)))}\n\n"
-            "Please review the `Sandbox_Schedule` tab. The HR manager will make it official after approval."
-        )
-    else:
-        summary_message = "**Subject: No Changes in New Schedule**\n\nNo changes were necessary in today's schedule run."
-        
-    print("\n--- Notification Summary ---")
-    print(summary_message)
-
-    return summary_message, affected_employees, sandbox_df
-
-
-# --- NEW TOKEN REDISTRIBUTION MODULE ---
-
-def redistribute_tokens(sheet, requests_df, official_schedule_df, sandbox_df):
-    """
-    Redistributes tokens from winners to affected employees or losing bidders.
-    """
-    print("--- Starting Token Redistribution ---")
-
-    employees_ws = sheet.worksheet("Employees")
-    emp_data = employees_ws.get_all_records()
-    token_balances = {row['Employee_Name']: row['Tokens_Official'] for row in emp_data}
-
-    # Identify winners by finding whose OFF request was fulfilled
-    winners = []
-    if not requests_df.empty:
-        for _, request in requests_df.iterrows():
-            emp, day = request['Employee_Name'], pd.to_datetime(request['Requested_Date'], dayfirst=True).day
-            day_col = official_schedule_df.columns[day] # Get column name like '2025-09-02 (Tue)'
-
-            # Check if the employee is working in the sandbox on their requested day off
-            is_working = any(sandbox_df.loc[shift_id, day_col] == emp for shift_id in sandbox_df.index)
-
-            if not is_working:
-                winners.append(request)
-
-    if not winners:
-        print("No winning requests to process for token redistribution.")
-        return
-
-    for winner in winners:
-        winner_name = winner['Employee_Name']
-        tokens_to_distribute = winner['Tokens_Bid']
-        day_of_win = pd.to_datetime(winner['Requested_Date'], dayfirst=True).day
-        day_col = official_schedule_df.columns[day_of_win]
-
-        print(f"Processing win for {winner_name} on day {day_of_win}. Tokens to redistribute: {tokens_to_distribute}")
-
-        # Deduct tokens from winner
-        token_balances[winner_name] -= tokens_to_distribute
-
-        # Priority 1: Find employees whose schedule changed on that day
-        changed_employees = []
-        for shift_id in official_schedule_df.index:
-            official_emp = official_schedule_df.loc[shift_id, day_col]
-            sandbox_emp = sandbox_df.loc[shift_id, day_col]
-            if official_emp != sandbox_emp:
-                # Someone whose shift was taken away
-                if official_emp and official_emp in token_balances: changed_employees.append(official_emp)
-                # Someone who was newly assigned to a shift
-                if sandbox_emp and sandbox_emp in token_balances: changed_employees.append(sandbox_emp)
-
-        # Remove the winner from the list of changed employees
-        changed_employees = [e for e in set(changed_employees) if e != winner_name]
-
-        if changed_employees:
-            print(f"Distributing tokens to changed employees: {changed_employees}")
-            tokens_per_person = tokens_to_distribute // len(changed_employees)
-            for emp in changed_employees:
-                token_balances[emp] += tokens_per_person
-        else:
-            # Priority 2: No one's schedule changed, find losing bidders for that day
-            losing_bidders = []
-            for _, request in requests_df.iterrows():
-                req_day = pd.to_datetime(request['Requested_Date'], dayfirst=True).day
-                # A loser is someone who requested the same day off but isn't the winner
-                if req_day == day_of_win and request['Employee_Name'] != winner_name:
-                    losing_bidders.append(request['Employee_Name'])
-
-            if losing_bidders:
-                print(f"Distributing tokens to losing bidders: {losing_bidders}")
-                tokens_per_person = tokens_to_distribute // len(losing_bidders)
-                for emp in losing_bidders:
-                    token_balances[emp] += tokens_per_person
-
-    # Batch update the token balances in the Google Sheet
-    employees_to_update = employees_ws.col_values(1)
-    cell_updates = []
-    for emp_name, new_balance in token_balances.items():
-        try:
-            row_index = employees_to_update.index(emp_name) + 1
-            # Column D is Tokens_Official, F is Tokens_Sandbox. Let's update both.
-            cell_updates.append(gspread.Cell(row_index, 4, new_balance))
-            cell_updates.append(gspread.Cell(row_index, 6, new_balance))
-        except ValueError:
+        # Get recipient email
+        recipient_email_series = employees_df[employees_df['Employee_Name'] == employee_name]['Email']
+        if recipient_email_series.empty:
+            print(f"⚠️ Could not find email for {employee_name}. Skipping offer.")
             continue
+        recipient_email = recipient_email_series.iloc[0]
 
-    if cell_updates:
-        employees_ws.update_cells(cell_updates)
-        print("✅ Token balances have been updated in the Google Sheet.")
+        # Create email content
+        hr_email = "hr.scheduler@example.com"
+        accept_subject = f"ACCEPT-{offer_id}"
+        decline_subject = f"DECLINE-{offer_id}"
+        accept_link = f"mailto:{hr_email}?subject={accept_subject}"
+        decline_link = f"mailto:{hr_email}?subject={decline_subject}"
+
+        email_body = (
+            f"Hello {employee_name},\n\nA change to your schedule has been proposed:\n\n"
+            + "\n".join(f"- {change}" for change in changes_list)
+            + f"\n\nPlease click to accept or decline:\n"
+            f"✅ Accept: {accept_link}\n"
+            f"❌ Decline: {decline_link}\n\n"
+            f"This offer is valid for 1 hour. Offer ID: {offer_id}"
+        )
+        
+        # Send the email
+        msg = EmailMessage()
+        msg.set_content(email_body)
+        msg['Subject'] = 'Schedule Change Proposal'
+        msg['From'] = sender_email
+        msg['To'] = recipient_email
+
+        try:
+            server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+            server.login(sender_email, app_password)
+            server.send_message(msg)
+            server.quit()
+            print(f"✅ Offer email sent to {employee_name} ({recipient_email}) for Offer ID {offer_id}")
+
+            # Log the offer to the sheet
+            expiry_time = (datetime.now() + timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+            offers_to_log.append([offer_id, employee_name, "PENDING", expiry_time])
+
+        except Exception as e:
+            print(f"❌ Failed to send offer email to {employee_name}: {e}")
+
+    if offers_to_log:
+        offers_ws.append_rows(offers_to_log)
+        print(f"✅ Logged {len(offers_to_log)} new offers to the 'Offers' tab.")
+
+    # Also update the sandbox sheet for HR review
+    sandbox_ws = sheet.worksheet("Sandbox_Schedule")
+    sandbox_ws.update([sandbox_df.columns.values.tolist()] + sandbox_df.reset_index().values.tolist())
+    print("✅ Sandbox_Schedule tab has been updated.")
+
+    return sandbox_df
+
+def process_email_replies(sheet):
+    """Logs into the HR inbox and processes replies to offers."""
+    print("--- Processing Email Replies ---")
+    try:
+        hr_email = os.environ.get('GMAIL_ADDRESS')
+        app_password = os.environ.get('GMAIL_APP_PASSWORD')
+        if not hr_email or not app_password:
+            print("❌ HR Email credentials not found. Cannot process replies.")
+            return
+
+        offers_ws = sheet.worksheet("Offers")
+
+        mail = imaplib.IMAP4_SSL("imap.gmail.com")
+        mail.login(hr_email, app_password)
+        mail.select("inbox")
+
+        # Search for unread emails with our specific subject format
+        status, data_accept = mail.search(None, '(UNSEEN SUBJECT "ACCEPT-")')
+        status, data_decline = mail.search(None, '(UNSEEN SUBJECT "DECLINE-")')
+
+        all_ids = data_accept[0].split() + data_decline[0].split()
+
+        for num in all_ids:
+            status, data = mail.fetch(num, '(RFC822)')
+            msg = email.message_from_bytes(data[0][1])
+            subject = msg['subject']
+
+            try:
+                response, offer_id = subject.split('-')
+                cell = offers_ws.find(offer_id)
+                if cell:
+                    offers_ws.update_cell(cell.row, 4, response.upper()) # Update 'Status' column
+                    print(f"✅ Processed reply for Offer {offer_id}. Status set to {response.upper()}.")
+                    # Mark email as read
+                    mail.store(num, '+FLAGS', '\\Seen')
+            except Exception as e:
+                print(f"⚠️ Could not parse subject: '{subject}'. Error: {e}")
+
+    except Exception as e:
+        print(f"❌ An error occurred while processing email replies: {e}")
+
+
 
 # --- Main script execution ---
 if __name__ == '__main__':
@@ -451,8 +403,11 @@ if __name__ == '__main__':
         new_solution = generate_schedule(employees_df, shifts_df, requests_df, official_schedule_df)
         
         if new_solution:
-            summary_message, affected_employees, sandbox_df = update_sandbox_and_compare(hr_sheet, new_solution, official_schedule_df)
+            sandbox_df = create_and_send_offers(hr_sheet, new_solution, official_schedule_df, employees_df)
 
-            redistribute_tokens(hr_sheet, requests_df, official_schedule_df, sandbox_df)
+            print("--- Waiting for 1 hour for employees to respond... ---")
+            time.sleep(3600) # Wait for 3600 seconds (1 hour)
 
-            send_notification_email(summary_message, affected_employees, employees_df)
+            process_email_replies(hr_sheet)
+
+            # ... (Finalize the schedule based on the new offer statuses) ...
