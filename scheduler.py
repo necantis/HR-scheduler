@@ -120,9 +120,13 @@ def read_data(sheet):
 
 # --- MODULE 2: SCHEDULING LOGIC (OR-TOOLS) ---
 
-def generate_schedule(employees_df, shifts_df, requests_df):
-    """Generates a new schedule based on the input data."""
-    print("--- Starting Schedule Generation ---")
+def generate_schedule(employees_df, shifts_df, requests_df, official_schedule_df):
+    """
+    Generates a schedule, using the official schedule as a hint and locking past days.
+    """
+    print("--- Starting Schedule Generation (with hints from Official Schedule) ---")
+
+    # --- STEP 1: DATA PREPARATION (Same as before) ---
     all_employees = employees_df['Employee_Name'].tolist()
     employees = {'Infirmier': [], 'Intérimaire': []}
     for _, row in employees_df.iterrows():
@@ -142,6 +146,13 @@ def generate_schedule(employees_df, shifts_df, requests_df):
             day_of_month = date_obj.day
             requests.append((row['Employee_Name'], day_of_month, 'OFF', row['Tokens_Bid']))
 
+    # --- NEW: Get today's date to lock past days ---
+    # In a real run, this is today. For testing, we can pretend it's Sept 3rd.
+    # today = datetime.now()
+    today = datetime(2025, 9, 3)
+    today_index = today.day - 1 # Day 3 corresponds to index 2
+
+    # --- STEP 2: CREATE THE MODEL AND VARIABLES (Same as before) ---
     num_days = 30
     days_of_week = [d % 7 for d in range(num_days)]
     model = cp_model.CpModel()
@@ -153,6 +164,26 @@ def generate_schedule(employees_df, shifts_df, requests_df):
                     if days_of_week[d] in s_info['days']:
                         works[(e, s_id, d)] = model.NewBoolVar(f'works_{e}_{s_id}_{d}')
 
+    # --- STEP 3: ADD THE CONSTRAINTS (with new locking logic) ---
+
+    # --- NEW: Lock all shifts for past and present days ---
+    print(f"Locking all shifts on and before Day {today.day}...")
+    date_columns = official_schedule_df.columns[1:]
+    for d in range(today_index + 1):
+        day_col = date_columns[d]
+        for _, row in official_schedule_df.iterrows():
+            shift_id = row['Shift']
+            official_employee = row[day_col]
+            if official_employee and (official_employee in all_employees):
+                # This shift must be assigned to this person
+                if (official_employee, shift_id, d) in works:
+                    model.Add(works[(official_employee, shift_id, d)] == 1)
+                # All other people cannot be assigned to this shift
+                for e in all_employees:
+                    if e != official_employee and (e, shift_id, d) in works:
+                        model.Add(works[(e, shift_id, d)] == 0)
+
+    # (All other hard constraints remain the same: coverage, 6-day work week, etc.)
     for s_id, s_info in shifts.items():
         for d in range(num_days):
             if days_of_week[d] in s_info['days']:
@@ -164,7 +195,10 @@ def generate_schedule(employees_df, shifts_df, requests_df):
             for d in range(num_days - 6):
                 worked_days = [works[key] for key in works if key[0] == e and d <= key[2] < d + 7]
                 model.Add(sum(worked_days) <= 6)
+
+    # --- STEP 4: DEFINE THE OBJECTIVE FUNCTION (with new hinting logic) ---
     
+    # Primary objective: Fulfill high-token requests
     request_bonuses = []
     if requests:
       for emp, day, shift_type, penalty in requests:
@@ -175,8 +209,25 @@ def generate_schedule(employees_df, shifts_df, requests_df):
               model.Add(sum(is_working_on_day) == 0).OnlyEnforceIf(request_fulfilled)
               model.Add(sum(is_working_on_day) > 0).OnlyEnforceIf(request_fulfilled.Not())
               request_bonuses.append(penalty * request_fulfilled)
-      model.Maximize(sum(request_bonuses))
-    
+
+    # --- NEW: Secondary objective: Prefer sticking to the official schedule ---
+    hint_bonuses = []
+    date_columns = official_schedule_df.columns[1:] # Re-get date_columns just in case
+    for d in range(today_index + 1, num_days): # Only for future days
+        day_col = date_columns[d]
+        for _, row in official_schedule_df.iterrows():
+            shift_id = row['Shift']
+            official_employee = row[day_col]
+            if official_employee and (official_employee in all_employees):
+                if (official_employee, shift_id, d) in works:
+                    # Add a small bonus (e.g., 1 point) for keeping this assignment
+                    hint_bonuses.append(works[(official_employee, shift_id, d)])
+
+    # Combine the objectives. Fulfilling a request (worth its token value) is much
+    # more important than sticking to the old schedule (worth 1 point).
+    model.Maximize(sum(request_bonuses) + sum(hint_bonuses))
+
+    # --- STEP 5 & 6: SOLVE AND RETURN (Same as before) ---
     solver = cp_model.CpSolver()
     status = solver.Solve(model)
 
