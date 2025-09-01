@@ -15,6 +15,9 @@ if __name__ == '__main__':
 
     scheduler = Scheduler(group=group, dry_run=is_dry_run)
     if scheduler.sheet:
+        if scheduler.check_for_pending_offers():
+            sys.exit(0) # Exit gracefully to prevent duplicate offers
+
         solution = scheduler.generate_schedule()
         if solution:
             scheduler.create_and_send_offers(solution)

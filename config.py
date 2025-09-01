@@ -8,6 +8,8 @@ REQUESTS_TAB = 'Absence_Requests'
 OFFICIAL_SCHEDULE_TAB = 'Official_Schedule'
 SANDBOX_SCHEDULE_TAB = 'Sandbox_Schedule'
 OFFERS_TAB = 'Offers'
+METADATA_TAB = 'Metadata'
+METADATA_CELL_REQUESTERS = 'A1'
 
 # Email settings
 HR_EMAIL = 'hr.scheduler@example.com' # The address for sending/receiving offers
@@ -46,3 +48,4 @@ COL_OFFER_EMPLOYEE = 'Employee_Name'
 COL_OFFER_STATUS = 'Status'
 COL_OFFER_EXPIRY = 'Expiry_Time'
 COL_OFFER_REQUESTER = 'Requester_Name'
+COL_OFFER_CHANGES_JSON = 'Changes_JSON'

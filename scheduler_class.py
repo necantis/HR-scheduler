@@ -12,6 +12,7 @@ import os
 import smtplib
 from email.message import EmailMessage
 import config
+import json
 
 class Scheduler:
     def __init__(self, group=None, dry_run=False):
@@ -68,6 +69,18 @@ class Scheduler:
         print("Reading offers data...")
         offers_ws = self.sheet.worksheet(config.OFFERS_TAB)
         return pd.DataFrame(offers_ws.get_all_records())
+
+    def check_for_pending_offers(self):
+        """Checks if there are any offers from a previous run that are still pending."""
+        print("--- Checking for pending offers from previous runs... ---")
+        offers_df = self._read_offers_data()
+        if not offers_df.empty:
+            pending_offers = offers_df[offers_df[config.COL_OFFER_STATUS] == 'PENDING']
+            if not pending_offers.empty:
+                print(f"⚠️ Found {len(pending_offers)} pending offers. Halting to avoid duplicate offers.")
+                return True
+        print("✅ No pending offers found. Proceeding.")
+        return False
 
     def generate_schedule(self):
         """
@@ -187,18 +200,18 @@ class Scheduler:
                 sandbox_data[col].append(employee)
         sandbox_df = pd.DataFrame(sandbox_data, index=self.official_schedule_df[config.COL_SCHEDULE_SHIFT])
 
-        winning_request = None
+        winners = []
         if not self.requests_df.empty:
             for _, request in self.requests_df.iterrows():
                 emp, day = request['Employee_Name'], pd.to_datetime(request['Start_Date'], dayfirst=True).day
                 day_col = self.official_schedule_df.columns[day]
                 is_working = any(sandbox_df.loc[shift_id, day_col] == emp for shift_id in sandbox_df.index)
                 if not is_working:
-                    winning_request = request
-                    break # Assume first winner is the one
+                    winners.append(request)
 
-        requester_name = winning_request['Employee_Name'] if winning_request is not None else "SYSTEM"
-        token_reward = winning_request['Tokens_Bid'] if winning_request is not None else 0
+        requester_name = ", ".join(w['Employee_Name'] for w in winners) if winners else "SYSTEM"
+        # For simplicity, we'll use the first winner's bid for the reward email.
+        token_reward = winners[0]['Tokens_Bid'] if winners else 0
 
         sender_email = os.environ.get('GMAIL_ADDRESS')
         app_password = os.environ.get('GMAIL_APP_PASSWORD')
@@ -209,7 +222,7 @@ class Scheduler:
         offers_ws = self.sheet.worksheet(config.OFFERS_TAB)
         offers_to_log = []
 
-        all_changes = {}
+        all_offers = {} # Key: employee_name, Value: list of change dicts
         for day_col in date_columns:
             for shift_id in self.official_schedule_df[config.COL_SCHEDULE_SHIFT]:
                 official_employee = self.official_schedule_df.loc[self.official_schedule_df[config.COL_SCHEDULE_SHIFT] == shift_id, day_col].iloc[0]
@@ -218,30 +231,37 @@ class Scheduler:
                 sandbox_employee = '' if pd.isna(sandbox_employee) else sandbox_employee
 
                 if official_employee != sandbox_employee:
-                # Change involving the employee being removed from the shift
-                    if official_employee:
-                        if official_employee not in all_changes: all_changes[official_employee] = []
-                        change_desc = f"On {day_col}, your shift '{shift_id}' was reassigned to {sandbox_employee or 'unassigned'}."
-                        all_changes[official_employee].append(change_desc)
+                    change_data = {
+                        'day': day_col,
+                        'shift': shift_id,
+                        'from': official_employee,
+                        'to': sandbox_employee
+                    }
 
-                # Change involving the employee being added to the shift
-                if sandbox_employee:
-                # If the slot was previously occupied, it's a real offer.
+                    # Add change to the person being removed (if any)
                     if official_employee:
-                        if sandbox_employee not in all_changes: all_changes[sandbox_employee] = []
-                        change_desc = f"On {day_col}, you were assigned to shift '{shift_id}' (previously {official_employee or 'unassigned'})."
-                        all_changes[sandbox_employee].append(change_desc)
-                    else:
-                        # The slot was empty, so this is a "free move". No offer needed.
+                        if official_employee not in all_offers: all_offers[official_employee] = []
+                        all_offers[official_employee].append(change_data)
+
+                    # Add change to the person being added (if it's not a free move)
+                    if sandbox_employee and official_employee:
+                        if sandbox_employee not in all_offers: all_offers[sandbox_employee] = []
+                        all_offers[sandbox_employee].append(change_data)
+                    elif sandbox_employee:
                         print(f"INFO: Auto-approving free move for {sandbox_employee} to shift '{shift_id}' on {day_col}.")
 
-        for employee_name, changes_list in all_changes.items():
+        for employee_name, changes in all_offers.items():
             offer_id = str(uuid.uuid4())
             recipient_email_series = self.employees_df[self.employees_df[config.COL_EMPLOYEE_NAME] == employee_name][config.COL_EMPLOYEE_EMAIL]
             if recipient_email_series.empty:
                 print(f"⚠️ Could not find email for {employee_name}. Skipping offer.")
                 continue
             recipient_email = recipient_email_series.iloc[0]
+
+            change_descriptions = [
+                f"On {c['day']}, shift '{c['shift']}' changed from '{c['from']}' to '{c['to']}'"
+                for c in changes
+            ]
 
             accept_subject = f"ACCEPT-{offer_id}"
             decline_subject = f"DECLINE-{offer_id}"
@@ -250,8 +270,8 @@ class Scheduler:
 
             email_body = (
                 f"Hello {employee_name},\n\n"
-            f"To accommodate a request from {requester_name}, you are being offered a reward of {token_reward} tokens to accept the following schedule change. This reward will be given to the first employee who accepts.\n\n"
-                + "\n".join(f"- {change}" for change in changes_list)
+                f"To accommodate a request from {requester_name}, you are being offered a reward of {token_reward} tokens to accept the following schedule change. This reward will be given to the first employee who accepts.\n\n"
+                + "\n".join(f"- {desc}" for desc in change_descriptions)
                 + f"\n\nPlease click to accept or decline:\n"
                 f"✅ Accept: {accept_link}\n"
                 f"❌ Decline: {decline_link}\n\n"
@@ -259,8 +279,10 @@ class Scheduler:
             )
 
             self._send_email(recipient_email, 'Schedule Change Proposal', email_body)
+
+            changes_json = json.dumps(changes)
             expiry_time = (datetime.now() + timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
-            offers_to_log.append([offer_id, employee_name, "PENDING", expiry_time, requester_name])
+            offers_to_log.append([offer_id, employee_name, "PENDING", expiry_time, requester_name, changes_json])
 
         if offers_to_log and not self.dry_run:
             offers_ws.append_rows(offers_to_log)
@@ -272,8 +294,13 @@ class Scheduler:
             sandbox_ws = self.sheet.worksheet(config.SANDBOX_SCHEDULE_TAB)
             sandbox_ws.update([sandbox_df.columns.values.tolist()] + sandbox_df.reset_index().values.tolist())
             print("✅ Sandbox_Schedule tab has been updated.")
+
+            metadata_ws = self.sheet.worksheet(config.METADATA_TAB)
+            metadata_ws.update_acell(config.METADATA_CELL_REQUESTERS, requester_name)
+            print(f"✅ Logged requesters '{requester_name}' to metadata sheet.")
         else:
             print("DRY RUN: Would have updated the Sandbox_Schedule tab.")
+            print(f"DRY RUN: Would have logged requesters '{requester_name}' to metadata sheet.")
 
         return sandbox_df
 
@@ -352,16 +379,15 @@ class Scheduler:
         failed_requesters = set()
 
         for _, offer in failed_offers.iterrows():
-            original_requester = offer[config.COL_OFFER_REQUESTER]
-            failed_requesters.add(original_requester)
+            failed_requesters.add(offer[config.COL_OFFER_REQUESTER])
 
-            for day_col in self.official_schedule_df.columns[1:]:
-                 for shift_id in self.official_schedule_df[config.COL_SCHEDULE_SHIFT]:
-                    official_employee = self.official_schedule_df.loc[self.official_schedule_df[config.COL_SCHEDULE_SHIFT] == shift_id, day_col].iloc[0]
-                    sandbox_employee = sandbox_df.loc[shift_id, day_col]
-
-                    if sandbox_employee != official_employee:
-                        final_sandbox_df.loc[shift_id, day_col] = official_employee
+            try:
+                changes_to_revert = json.loads(offer[config.COL_OFFER_CHANGES_JSON])
+                for change in changes_to_revert:
+                    final_sandbox_df.loc[change['shift'], change['day']] = change['from']
+            except (json.JSONDecodeError, KeyError) as e:
+                print(f"⚠️ Could not parse or revert changes for offer {offer[config.COL_OFFER_ID]}. Error: {e}")
+                continue
 
         if not self.dry_run:
             sandbox_ws = self.sheet.worksheet(config.SANDBOX_SCHEDULE_TAB)
@@ -471,12 +497,12 @@ class Scheduler:
             print(f"❌ Failed to send email to {recipient_email}: {e}")
             return False
 
-    def send_hr_summary(self, accepted_count, declined_count):
+    def send_hr_summary(self, accepted_count, declined_count, requester_names):
         print("--- Sending HR Summary Email ---")
         hr_email = config.HR_EMAIL
         subject = "Hourly Schedule Run Summary"
         body = (
-            f"The hourly reply processing is complete.\n\n"
+            f"The hourly reply processing is complete for the absence request(s) from {requester_names}.\n\n"
             f"- {accepted_count} offers were accepted.\n"
             f"- {declined_count} offers were declined.\n\n"
             "The Sandbox schedule is now finalized and ready for your one-click approval."
