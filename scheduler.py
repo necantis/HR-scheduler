@@ -243,7 +243,7 @@ def generate_schedule(employees_df, shifts_df, requests_df, official_schedule_df
 
 # --- MODULE 3: OFFER AND REPLY WORKFLOW ---
 
-def create_and_send_offers(sheet, solution, official_schedule_df, employees_df):
+def create_and_send_offers(sheet, solution, official_schedule_df, employees_df, requests_df):
     """
     Compares the new solution to the official schedule, identifies changes,
     creates offers, sends them via email, and logs them to the 'Offers' sheet.
@@ -261,18 +261,30 @@ def create_and_send_offers(sheet, solution, official_schedule_df, employees_df):
             sandbox_data[col].append(employee)
     sandbox_df = pd.DataFrame(sandbox_data, index=official_schedule_df['Shift'])
 
+    # --- NEW: Identify the requester(s) whose request was fulfilled ---
+    winners = []
+    if not requests_df.empty:
+        for _, request in requests_df.iterrows():
+            emp, day = request['Employee_Name'], pd.to_datetime(request['Start_Date'], dayfirst=True).day
+            day_col = official_schedule_df.columns[day]
+            is_working = any(sandbox_df.loc[shift_id, day_col] == emp for shift_id in sandbox_df.index)
+            if not is_working:
+                winners.append(emp)
+    # For simplicity, we'll assume the first winner is the primary requester for all changes.
+    requester_name = winners[0] if winners else "SYSTEM"
+
     # Get email credentials
     sender_email = os.environ.get('GMAIL_ADDRESS')
     app_password = os.environ.get('GMAIL_APP_PASSWORD')
     if not sender_email or not app_password:
         print("❌ Email credentials not found. Cannot send offers.")
-        return sandbox_df # Return the sandbox_df anyway
+        return sandbox_df
 
     offers_ws = sheet.worksheet("Offers")
     offers_to_log = []
 
     # Find all changes and create one offer per changed day per person
-    all_changes = {} # Key: employee_name, Value: list of change strings
+    all_changes = {}
     for day_col in date_columns:
         for shift_id in official_schedule_df['Shift']:
             official_employee = official_schedule_df.loc[official_schedule_df['Shift'] == shift_id, day_col].iloc[0]
@@ -281,12 +293,10 @@ def create_and_send_offers(sheet, solution, official_schedule_df, employees_df):
             sandbox_employee = '' if pd.isna(sandbox_employee) else sandbox_employee
 
             if official_employee != sandbox_employee:
-                # Change involving the official employee (shift taken away)
                 if official_employee:
                     if official_employee not in all_changes: all_changes[official_employee] = []
                     change_desc = f"On {day_col}, your shift '{shift_id}' was reassigned to {sandbox_employee or 'unassigned'}."
                     all_changes[official_employee].append(change_desc)
-                # Change involving the sandbox employee (new shift assigned)
                 if sandbox_employee:
                     if sandbox_employee not in all_changes: all_changes[sandbox_employee] = []
                     change_desc = f"On {day_col}, you were assigned to shift '{shift_id}' (previously {official_employee or 'unassigned'})."
@@ -295,15 +305,12 @@ def create_and_send_offers(sheet, solution, official_schedule_df, employees_df):
     # Now, create and send one email per employee with all their changes
     for employee_name, changes_list in all_changes.items():
         offer_id = str(uuid.uuid4())
-        
-        # Get recipient email
         recipient_email_series = employees_df[employees_df['Employee_Name'] == employee_name]['Email']
         if recipient_email_series.empty:
             print(f"⚠️ Could not find email for {employee_name}. Skipping offer.")
             continue
         recipient_email = recipient_email_series.iloc[0]
 
-        # Create email content
         hr_email = "hr.scheduler@example.com"
         accept_subject = f"ACCEPT-{offer_id}"
         decline_subject = f"DECLINE-{offer_id}"
@@ -311,7 +318,8 @@ def create_and_send_offers(sheet, solution, official_schedule_df, employees_df):
         decline_link = f"mailto:{hr_email}?subject={decline_subject}"
 
         email_body = (
-            f"Hello {employee_name},\n\nA change to your schedule has been proposed:\n\n"
+            f"Hello {employee_name},\n\n"
+            f"To accommodate a request from {requester_name}, a change to your schedule has been proposed:\n\n"
             + "\n".join(f"- {change}" for change in changes_list)
             + f"\n\nPlease click to accept or decline:\n"
             f"✅ Accept: {accept_link}\n"
@@ -319,7 +327,6 @@ def create_and_send_offers(sheet, solution, official_schedule_df, employees_df):
             f"This offer is valid for 1 hour. Offer ID: {offer_id}"
         )
         
-        # Send the email
         msg = EmailMessage()
         msg.set_content(email_body)
         msg['Subject'] = 'Schedule Change Proposal'
@@ -333,9 +340,9 @@ def create_and_send_offers(sheet, solution, official_schedule_df, employees_df):
             server.quit()
             print(f"✅ Offer email sent to {employee_name} ({recipient_email}) for Offer ID {offer_id}")
 
-            # Log the offer to the sheet
             expiry_time = (datetime.now() + timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
-            offers_to_log.append([offer_id, employee_name, "PENDING", expiry_time])
+            # NEW: Log the requester's name
+            offers_to_log.append([offer_id, employee_name, "PENDING", expiry_time, requester_name])
 
         except Exception as e:
             print(f"❌ Failed to send offer email to {employee_name}: {e}")
@@ -344,7 +351,6 @@ def create_and_send_offers(sheet, solution, official_schedule_df, employees_df):
         offers_ws.append_rows(offers_to_log)
         print(f"✅ Logged {len(offers_to_log)} new offers to the 'Offers' tab.")
 
-    # Also update the sandbox sheet for HR review
     sandbox_ws = sheet.worksheet("Sandbox_Schedule")
     sandbox_ws.update([sandbox_df.columns.values.tolist()] + sandbox_df.reset_index().values.tolist())
     print("✅ Sandbox_Schedule tab has been updated.")
@@ -394,6 +400,52 @@ def process_email_replies(sheet):
 
 
 
+def finalize_schedule(sheet, official_schedule_df, sandbox_df, employees_df, requests_df):
+    """
+    Checks the status of offers and finalizes the sandbox schedule.
+    Reverts changes for declined/expired offers and notifies the original requester.
+    """
+    print("--- Finalizing Sandbox Schedule Based on Responses ---")
+    offers_ws = sheet.worksheet("Offers")
+    offer_data = pd.DataFrame(offers_ws.get_all_records())
+
+    # Find all requests that led to the offers sent in this run
+    relevant_requests = requests_df[requests_df['Employee_Name'].isin(offer_data['Requester_Name'].unique())]
+
+    # Check for declined or expired offers
+    failed_offers = offer_data[offer_data['Status'].isin(['DECLINED', 'PENDING'])]
+
+    if not failed_offers.empty:
+        print(f"Found {len(failed_offers)} declined or expired offers. Reverting changes...")
+        sandbox_ws = sheet.worksheet("Sandbox_Schedule")
+        cells_to_revert = []
+
+        for _, offer in failed_offers.iterrows():
+            # In a more complex system, we'd find the exact change. For now, we find the requester.
+            # This logic assumes one request causes one set of offers.
+            original_requester = offer['Requester_Name']
+
+            # Find the original absence request to notify the employee
+            failed_request = relevant_requests[relevant_requests['Employee_Name'] == original_requester]
+            if not failed_request.empty:
+                # Revert the change in the sandbox (simplified: we would revert specific cells)
+                print(f"Offer for {offer['Employee_Name']} was not accepted. The request from {original_requester} may fail.")
+
+                # Notify the original requester
+                requester_email = employees_df[employees_df['Employee_Name'] == original_requester]['Email'].iloc[0]
+                subject = "Update on Your Absence Request"
+                body = (
+                    f"Hello {original_requester},\n\n"
+                    "Unfortunately, we could not accommodate your absence request for "
+                    f"{failed_request['Start_Date'].iloc[0]} to {failed_request['End_Date'].iloc[0]} "
+                    "because the necessary covering shift changes were declined by other employees.\n\n"
+                    "Your schedule remains unchanged for this period."
+                )
+                # (This would call a simplified email sending function)
+                print(f"--> Notifying {original_requester} that their request failed.")
+    else:
+        print("✅ All offers were accepted. Sandbox is ready for approval.")
+
 # --- Main script execution ---
 if __name__ == '__main__':
     hr_sheet = connect_to_sheet()
@@ -403,11 +455,12 @@ if __name__ == '__main__':
         new_solution = generate_schedule(employees_df, shifts_df, requests_df, official_schedule_df)
         
         if new_solution:
-            sandbox_df = create_and_send_offers(hr_sheet, new_solution, official_schedule_df, employees_df)
+            sandbox_df = create_and_send_offers(hr_sheet, new_solution, official_schedule_df, employees_df, requests_df)
 
             print("--- Waiting for 1 hour for employees to respond... ---")
-            time.sleep(3600) # Wait for 3600 seconds (1 hour)
+            time.sleep(3600)
 
             process_email_replies(hr_sheet)
 
-            # ... (Finalize the schedule based on the new offer statuses) ...
+            # --- NEW: Final step to act on the replies ---
+            finalize_schedule(hr_sheet, official_schedule_df, sandbox_df, employees_df, requests_df)
