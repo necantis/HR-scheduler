@@ -349,7 +349,98 @@ def update_sandbox_and_compare(sheet, solution, official_schedule_df):
     print("\n--- Notification Summary ---")
     print(summary_message)
 
-    return summary_message, affected_employees
+    return summary_message, affected_employees, sandbox_df
+
+
+# --- NEW TOKEN REDISTRIBUTION MODULE ---
+
+def redistribute_tokens(sheet, requests_df, official_schedule_df, sandbox_df):
+    """
+    Redistributes tokens from winners to affected employees or losing bidders.
+    """
+    print("--- Starting Token Redistribution ---")
+
+    employees_ws = sheet.worksheet("Employees")
+    emp_data = employees_ws.get_all_records()
+    token_balances = {row['Employee_Name']: row['Tokens_Official'] for row in emp_data}
+
+    # Identify winners by finding whose OFF request was fulfilled
+    winners = []
+    if not requests_df.empty:
+        for _, request in requests_df.iterrows():
+            emp, day = request['Employee_Name'], pd.to_datetime(request['Requested_Date'], dayfirst=True).day
+            day_col = official_schedule_df.columns[day] # Get column name like '2025-09-02 (Tue)'
+
+            # Check if the employee is working in the sandbox on their requested day off
+            is_working = any(sandbox_df.loc[shift_id, day_col] == emp for shift_id in sandbox_df.index)
+
+            if not is_working:
+                winners.append(request)
+
+    if not winners:
+        print("No winning requests to process for token redistribution.")
+        return
+
+    for winner in winners:
+        winner_name = winner['Employee_Name']
+        tokens_to_distribute = winner['Tokens_Bid']
+        day_of_win = pd.to_datetime(winner['Requested_Date'], dayfirst=True).day
+        day_col = official_schedule_df.columns[day_of_win]
+
+        print(f"Processing win for {winner_name} on day {day_of_win}. Tokens to redistribute: {tokens_to_distribute}")
+
+        # Deduct tokens from winner
+        token_balances[winner_name] -= tokens_to_distribute
+
+        # Priority 1: Find employees whose schedule changed on that day
+        changed_employees = []
+        for shift_id in official_schedule_df.index:
+            official_emp = official_schedule_df.loc[shift_id, day_col]
+            sandbox_emp = sandbox_df.loc[shift_id, day_col]
+            if official_emp != sandbox_emp:
+                # Someone whose shift was taken away
+                if official_emp and official_emp in token_balances: changed_employees.append(official_emp)
+                # Someone who was newly assigned to a shift
+                if sandbox_emp and sandbox_emp in token_balances: changed_employees.append(sandbox_emp)
+
+        # Remove the winner from the list of changed employees
+        changed_employees = [e for e in set(changed_employees) if e != winner_name]
+
+        if changed_employees:
+            print(f"Distributing tokens to changed employees: {changed_employees}")
+            tokens_per_person = tokens_to_distribute // len(changed_employees)
+            for emp in changed_employees:
+                token_balances[emp] += tokens_per_person
+        else:
+            # Priority 2: No one's schedule changed, find losing bidders for that day
+            losing_bidders = []
+            for _, request in requests_df.iterrows():
+                req_day = pd.to_datetime(request['Requested_Date'], dayfirst=True).day
+                # A loser is someone who requested the same day off but isn't the winner
+                if req_day == day_of_win and request['Employee_Name'] != winner_name:
+                    losing_bidders.append(request['Employee_Name'])
+
+            if losing_bidders:
+                print(f"Distributing tokens to losing bidders: {losing_bidders}")
+                tokens_per_person = tokens_to_distribute // len(losing_bidders)
+                for emp in losing_bidders:
+                    token_balances[emp] += tokens_per_person
+
+    # Batch update the token balances in the Google Sheet
+    employees_to_update = employees_ws.col_values(1)
+    cell_updates = []
+    for emp_name, new_balance in token_balances.items():
+        try:
+            row_index = employees_to_update.index(emp_name) + 1
+            # Column D is Tokens_Official, F is Tokens_Sandbox. Let's update both.
+            cell_updates.append(gspread.Cell(row_index, 4, new_balance))
+            cell_updates.append(gspread.Cell(row_index, 6, new_balance))
+        except ValueError:
+            continue
+
+    if cell_updates:
+        employees_ws.update_cells(cell_updates)
+        print("✅ Token balances have been updated in the Google Sheet.")
 
 # --- Main script execution ---
 if __name__ == '__main__':
@@ -357,11 +448,11 @@ if __name__ == '__main__':
     if hr_sheet:
         employees_df, shifts_df, requests_df, official_schedule_df = read_data(hr_sheet)
         
-        new_solution = generate_schedule(employees_df, shifts_df, requests_df)
+        new_solution = generate_schedule(employees_df, shifts_df, requests_df, official_schedule_df)
         
         if new_solution:
-            # The compare function now also returns the list of affected people
-            summary_message, affected_employees = update_sandbox_and_compare(hr_sheet, new_solution, official_schedule_df)
+            summary_message, affected_employees, sandbox_df = update_sandbox_and_compare(hr_sheet, new_solution, official_schedule_df)
 
-            # Send the email
+            redistribute_tokens(hr_sheet, requests_df, official_schedule_df, sandbox_df)
+
             send_notification_email(summary_message, affected_employees, employees_df)
