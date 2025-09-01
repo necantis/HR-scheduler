@@ -80,45 +80,72 @@ if __name__ == '__main__':
         print(requests_df)
         print("\n------------------------------------")
 
-# (Keep all previous code: connect_to_sheet, read_employees, etc.)
-# ...
-
-from ortools.sat.python import cp_model
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
 import pandas as pd
 from datetime import datetime, timedelta
+from ortools.sat.python import cp_model
 
-def generate_and_write_schedule(hr_sheet, employees_df, shifts_df, requests_df):
-    """
-    Generates a schedule and writes it directly to the Google Sheet.
-    """
-    print("\n--- Starting Schedule Generation ---")
+# --- MODULE 1: GOOGLE SHEETS CONNECTION & DATA READING ---
 
-    # --- STEP 1: CONVERT DATAFRAMES TO OR-TOOLS FORMAT ---
-    # (This section remains the same as the previous version)
+def connect_to_sheet():
+    """Connects to the Google Sheet."""
+    try:
+        scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
+        creds = ServiceAccountCredentials.from_json_keyfile_name('creds.json', scope)
+        client = gspread.authorize(creds)
+        spreadsheet = client.open('2025_HR Planner')
+        print("✅ Successfully connected to the Google Sheet.")
+        return spreadsheet
+    except Exception as e:
+        print(f"❌ Error connecting to Google Sheet: {e}")
+        return None
+
+def read_data(sheet):
+    """Reads all required data from the Google Sheet into DataFrames."""
+    print("Reading data from all tabs...")
+    employees_ws = sheet.worksheet("Employees")
+    employees_df = pd.DataFrame(employees_ws.get_all_records())
+
+    shifts_ws = sheet.worksheet("Shifts")
+    shifts_df = pd.DataFrame(shifts_ws.get_all_records())
+
+    requests_ws = sheet.worksheet("Absence_Requests")
+    requests_df = pd.DataFrame(requests_ws.get_all_records())
+    if not requests_df.empty:
+        requests_df = requests_df.rename(columns={"Nom": "Employee_Name", "Date": "Requested_Date", "Tokens": "Tokens_Bid"})
+    
+    official_schedule_ws = sheet.worksheet("Official_Schedule")
+    official_schedule_df = pd.DataFrame(official_schedule_ws.get_all_records())
+
+    return employees_df, shifts_df, requests_df, official_schedule_df
+
+# --- MODULE 2: SCHEDULING LOGIC (OR-TOOLS) ---
+
+def generate_schedule(employees_df, shifts_df, requests_df):
+    """Generates a new schedule based on the input data."""
+    print("--- Starting Schedule Generation ---")
     all_employees = employees_df['Employee_Name'].tolist()
     employees = {'Infirmier': [], 'Intérimaire': []}
-    for index, row in employees_df.iterrows():
-        name = row['Employee_Name']
-        role = row['Role']
+    for _, row in employees_df.iterrows():
+        name, role = row['Employee_Name'], row['Role']
         if role in employees: employees[role].append(name)
 
     shifts = {}
-    for index, row in shifts_df.iterrows():
+    for _, row in shifts_df.iterrows():
         shift_id = row['Shift_ID']
         applicable_days = [int(day) for day in str(row['Applicable_Days'])]
         shifts[shift_id] = {'duration': int(row['Duration_Hours'] * 100), 'role': row['Role'], 'days': applicable_days}
-
+    
     requests = []
-    for index, row in requests_df.iterrows():
-        date_obj = pd.to_datetime(row['Requested_Date'], dayfirst=True)
-        day_of_month = date_obj.day
-        requests.append((row['Employee_Name'], day_of_month, 'OFF', row['Tokens_Bid']))
+    if not requests_df.empty:
+        for _, row in requests_df.iterrows():
+            date_obj = pd.to_datetime(row['Requested_Date'], dayfirst=True)
+            day_of_month = date_obj.day
+            requests.append((row['Employee_Name'], day_of_month, 'OFF', row['Tokens_Bid']))
 
     num_days = 30
     days_of_week = [d % 7 for d in range(num_days)]
-
-    # --- STEP 2: CREATE THE MODEL AND VARIABLES ---
-    # (This section remains the same)
     model = cp_model.CpModel()
     works = {}
     for e in all_employees:
@@ -128,8 +155,6 @@ def generate_and_write_schedule(hr_sheet, employees_df, shifts_df, requests_df):
                     if days_of_week[d] in s_info['days']:
                         works[(e, s_id, d)] = model.NewBoolVar(f'works_{e}_{s_id}_{d}')
 
-    # --- STEP 3: ADD THE CONSTRAINTS ---
-    # (This section remains the same)
     for s_id, s_info in shifts.items():
         for d in range(num_days):
             if days_of_week[d] in s_info['days']:
@@ -141,96 +166,105 @@ def generate_and_write_schedule(hr_sheet, employees_df, shifts_df, requests_df):
             for d in range(num_days - 6):
                 worked_days = [works[key] for key in works if key[0] == e and d <= key[2] < d + 7]
                 model.Add(sum(worked_days) <= 6)
-
-    # --- STEP 4: DEFINE THE OBJECTIVE FUNCTION ---
-    # (This section remains the same)
+    
     request_bonuses = []
-    for emp, day, shift_type, penalty in requests:
-        day_index = day - 1
-        if shift_type == 'OFF':
-            is_working_on_day = [works[key] for key in works if key[0] == emp and key[2] == day_index]
-            request_fulfilled = model.NewBoolVar(f'request_{emp}_{day_index}')
-            model.Add(sum(is_working_on_day) == 0).OnlyEnforceIf(request_fulfilled)
-            model.Add(sum(is_working_on_day) > 0).OnlyEnforceIf(request_fulfilled.Not())
-            request_bonuses.append(penalty * request_fulfilled)
-
-    model.Maximize(sum(request_bonuses))
-
-    # --- STEP 5: SOLVE THE MODEL ---
+    if requests:
+      for emp, day, shift_type, penalty in requests:
+          day_index = day - 1
+          if shift_type == 'OFF':
+              is_working_on_day = [works[key] for key in works if key[0] == emp and key[2] == day_index]
+              request_fulfilled = model.NewBoolVar(f'request_{emp}_{day_index}')
+              model.Add(sum(is_working_on_day) == 0).OnlyEnforceIf(request_fulfilled)
+              model.Add(sum(is_working_on_day) > 0).OnlyEnforceIf(request_fulfilled.Not())
+              request_bonuses.append(penalty * request_fulfilled)
+      model.Maximize(sum(request_bonuses))
+    
     solver = cp_model.CpSolver()
     status = solver.Solve(model)
 
-    # --- STEP 6: WRITE THE SOLUTION TO GOOGLE SHEET ---
-    if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-        print("✅ Solution Found! Writing schedule to Google Sheet...")
-
-        schedule_ws = hr_sheet.worksheet("Schedule")
-
-        # Prepare data for batch update
-        # Get the start date from your header, e.g., '2025-09-01 (Mon)'
-        start_date_str = schedule_ws.cell(1, 2).value.split(' ')[0]
-        start_date = datetime.strptime(start_date_str, '%Y-%m-%d')
-
-        update_cells = []
-
-        # Create a list of Shift IDs to find the row number
-        shift_ids = shifts_df['Shift_ID'].tolist()
-
-        for d in range(num_days):
-            col_index = d + 2 # Column B is 2, C is 3, etc.
-            current_date = start_date + timedelta(days=d)
-
-            # Update header to ensure it's correct
-            day_name = current_date.strftime('%a')
-            date_header = f"{current_date.strftime('%Y-%m-%d')} ({day_name})"
-            update_cells.append(gspread.Cell(1, col_index, date_header))
-
-            for s_id in shifts:
-                if days_of_week[d] in shifts[s_id]['days']:
-                    row_index = shift_ids.index(s_id) + 2 # Row 2 is H, 3 is I1, etc.
-                    assigned_employee = ''
-                    for e in all_employees:
-                        if (e, s_id, d) in works and solver.Value(works[(e, s_id, d)]):
-                            assigned_employee = e
-                            break
-                    update_cells.append(gspread.Cell(row_index, col_index, assigned_employee))
-
-        # Perform the batch update
-        schedule_ws.update_cells(update_cells)
-        print("✅ Schedule tab has been updated.")
-
-        # --- UPDATE TOKEN BALANCES ---
-        employees_ws = hr_sheet.worksheet("Employees")
-        employee_names = employees_ws.col_values(1) # Get all names from column A
-
-        for emp, day, shift_type, tokens in requests:
-            day_index = day - 1
-            is_working = any(solver.Value(works.get((emp, s_id, day_index), 0)) for s_id in shifts)
-
-            if not is_working: # Request was fulfilled
-                print(f"Fulfilled request for {emp}. Deducting {tokens} tokens.")
-                try:
-                    row_index = employee_names.index(emp) + 1
-                    current_tokens = int(employees_ws.cell(row_index, 4).value)
-                    new_balance = current_tokens - tokens
-                    employees_ws.update_cell(row_index, 4, new_balance)
-                except ValueError:
-                    print(f"Warning: Could not find employee {emp} to update tokens.")
-
-        print("✅ Token balances have been updated.")
-
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        print("✅ Schedule generated successfully.")
+        solution = {}
+        for (e, s, d), var in works.items():
+            if solver.Value(var):
+                solution[(s, d)] = e
+        return solution
     else:
-        print("\n❌ No solution found.")
+        print("❌ No solution found.")
+        return None
 
+# --- MODULE 3: WRITE, COMPARE, AND NOTIFY ---
+
+def update_sandbox_and_compare(sheet, solution, official_schedule_df):
+    """Writes to the sandbox, compares it to the official, and generates a clean summary."""
+    print("--- Updating Sandbox & Comparing Schedules ---")
+    
+    sandbox_ws = sheet.worksheet("Sandbox_Schedule")
+    
+    sandbox_data = {}
+    date_columns = official_schedule_df.columns[1:]
+    for col in date_columns:
+        sandbox_data[col] = []
+        day_index = date_columns.get_loc(col)
+        for shift_id in official_schedule_df['Shift']:
+            employee = solution.get((shift_id, day_index), '')
+            sandbox_data[col].append(employee)
+            
+    sandbox_df = pd.DataFrame(sandbox_data, index=official_schedule_df['Shift'])
+    
+    sandbox_ws.update([sandbox_df.columns.values.tolist()] + sandbox_df.values.tolist(), value_input_option='USER_ENTERED')
+    print("✅ Sandbox_Schedule tab has been updated.")
+
+    changes = []
+    affected_employees = set()
+    for day_col in date_columns:
+        day_changes = []
+        for shift_id in official_schedule_df['Shift']:
+            # Use .get() to avoid errors if a column/row name is weird
+            official_employee = official_schedule_df.loc[official_schedule_df['Shift'] == shift_id, day_col].iloc[0]
+            sandbox_employee = sandbox_df.loc[shift_id, day_col]
+            
+            # Convert blank values to a consistent empty string for comparison
+            official_employee = '' if pd.isna(official_employee) or official_employee in ['(blank)', '...'] else official_employee
+            sandbox_employee = '' if pd.isna(sandbox_employee) else sandbox_employee
+
+            # --- IMPROVEMENT HERE ---
+            # Only report a change if the values are actually different
+            if str(official_employee) != str(sandbox_employee):
+                # Make the output cleaner
+                from_text = f"'{official_employee}'" if official_employee else "empty"
+                to_text = f"**'{sandbox_employee}'**" if sandbox_employee else "**empty**"
+                
+                day_changes.append(f"* **Shift {shift_id}:** Changed from {from_text} to {to_text}")
+                
+                # Add employees to the affected list
+                if official_employee: affected_employees.add(official_employee)
+                if sandbox_employee: affected_employees.add(sandbox_employee)
+        
+        if day_changes:
+            changes.append(f"**Changes for {day_col}:**\n" + "\n".join(day_changes))
+
+    if changes:
+        summary_message = (
+            "**Subject: New Schedule Proposal Ready for Review**\n\n"
+            "A new schedule has been generated in the sandbox based on recent requests.\n\n"
+            "**Summary of Changes:**\n\n" + "\n\n".join(changes) + "\n\n"
+            f"**Affected Employees:** {', '.join(sorted(list(affected_employees)))}\n\n"
+            "Please review the `Sandbox_Schedule` tab. The HR manager will make it official after approval."
+        )
+    else:
+        summary_message = "**Subject: No Changes in New Schedule**\n\nNo changes were necessary in today's schedule run."
+        
+    print("\n--- Notification Summary ---")
+    print(summary_message)
 
 # --- Main script execution ---
 if __name__ == '__main__':
     hr_sheet = connect_to_sheet()
-
     if hr_sheet:
-        employees_df = read_employees(hr_sheet)
-        shifts_df = read_shifts(hr_sheet)
-        requests_df = read_requests(hr_sheet)
-
-        # Call the final function
-        generate_and_write_schedule(hr_sheet, employees_df, shifts_df, requests_df)
+        employees_df, shifts_df, requests_df, official_schedule_df = read_data(hr_sheet)
+        
+        new_solution = generate_schedule(employees_df, shifts_df, requests_df)
+        
+        if new_solution:
+            update_sandbox_and_compare(hr_sheet, new_solution, official_schedule_df)
