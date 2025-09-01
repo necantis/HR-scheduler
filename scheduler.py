@@ -10,77 +10,6 @@ Original file is located at
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 import pandas as pd
-
-def connect_to_sheet():
-    """
-    Connects to the Google Sheet using the credentials file.
-
-    Returns:
-        gspread.Spreadsheet: The spreadsheet object.
-    """
-    try:
-        scope = ['https://spreadsheets.google.com/feeds',
-                 'https://www.googleapis.com/auth/drive']
-        creds = ServiceAccountCredentials.from_json_keyfile_name('creds.json', scope)
-        client = gspread.authorize(creds)
-        spreadsheet = client.open('2025_HR Planner')
-        print("✅ Successfully connected to the Google Sheet.")
-        return spreadsheet
-    except Exception as e:
-        print(f"❌ Error connecting to Google Sheet: {e}")
-        return None
-
-# --- NEW FUNCTIONS START HERE ---
-
-def read_employees(sheet):
-    """Reads the Employees tab into a pandas DataFrame."""
-    print("Reading employee data...")
-    worksheet = sheet.worksheet("Employees")
-    data = worksheet.get_all_records()
-    return pd.DataFrame(data)
-
-def read_shifts(sheet):
-    """Reads the Shifts tab into a pandas DataFrame."""
-    print("Reading shift definitions...")
-    worksheet = sheet.worksheet("Shifts")
-    data = worksheet.get_all_records()
-    return pd.DataFrame(data)
-
-def read_requests(sheet):
-    """Reads the Absence_Requests tab into a pandas DataFrame."""
-    print("Reading absence requests...")
-    # Note the use of the French column names you specified.
-    worksheet = sheet.worksheet("Absence_Requests")
-    data = worksheet.get_all_records()
-    df = pd.DataFrame(data)
-    # Ensure the column names in the script match your sheet
-    df = df.rename(columns={"Nom": "Employee_Name", "Date": "Requested_Date", "Tokens": "Tokens_Bid"})
-    return df
-
-# --- Main script execution ---
-if __name__ == '__main__':
-    # Step 1: Connect to our spreadsheet
-    hr_sheet = connect_to_sheet()
-
-    if hr_sheet:
-        # Step 2: Read data from the tabs
-        employees_df = read_employees(hr_sheet)
-        shifts_df = read_shifts(hr_sheet)
-        requests_df = read_requests(hr_sheet)
-
-        # Print the data to verify it was read correctly
-        print("\n--- Data Read from Google Sheet ---")
-        print("\nEmployees:")
-        print(employees_df)
-        print("\nShifts:")
-        print(shifts_df)
-        print("\nAbsence Requests:")
-        print(requests_df)
-        print("\n------------------------------------")
-
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-import pandas as pd
 from datetime import datetime, timedelta, date
 import calendar
 from ortools.sat.python import cp_model
@@ -228,6 +157,8 @@ def generate_schedule(employees_df, shifts_df, requests_df, official_schedule_df
 
     # (Solver and return logic remains the same)
     solver = cp_model.CpSolver()
+    # Use 4 parallel workers to speed up the search
+    solver.parameters.num_search_workers = 4
     status = solver.Solve(model)
 
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -326,7 +257,7 @@ def create_and_send_offers(sheet, solution, official_schedule_df, employees_df, 
             f"❌ Decline: {decline_link}\n\n"
             f"This offer is valid for 1 hour. Offer ID: {offer_id}"
         )
-        
+
         msg = EmailMessage()
         msg.set_content(email_body)
         msg['Subject'] = 'Schedule Change Proposal'
@@ -402,49 +333,141 @@ def process_email_replies(sheet):
 
 def finalize_schedule(sheet, official_schedule_df, sandbox_df, employees_df, requests_df):
     """
-    Checks the status of offers and finalizes the sandbox schedule.
-    Reverts changes for declined/expired offers and notifies the original requester.
+    Checks offer statuses, reverts changes for failed offers, and notifies requesters.
     """
     print("--- Finalizing Sandbox Schedule Based on Responses ---")
     offers_ws = sheet.worksheet("Offers")
     offer_data = pd.DataFrame(offers_ws.get_all_records())
 
-    # Find all requests that led to the offers sent in this run
-    relevant_requests = requests_df[requests_df['Employee_Name'].isin(offer_data['Requester_Name'].unique())]
-
-    # Check for declined or expired offers
+    # Check for declined or expired offers (PENDING is treated as expired)
     failed_offers = offer_data[offer_data['Status'].isin(['DECLINED', 'PENDING'])]
 
-    if not failed_offers.empty:
-        print(f"Found {len(failed_offers)} declined or expired offers. Reverting changes...")
-        sandbox_ws = sheet.worksheet("Sandbox_Schedule")
-        cells_to_revert = []
-
-        for _, offer in failed_offers.iterrows():
-            # In a more complex system, we'd find the exact change. For now, we find the requester.
-            # This logic assumes one request causes one set of offers.
-            original_requester = offer['Requester_Name']
-
-            # Find the original absence request to notify the employee
-            failed_request = relevant_requests[relevant_requests['Employee_Name'] == original_requester]
-            if not failed_request.empty:
-                # Revert the change in the sandbox (simplified: we would revert specific cells)
-                print(f"Offer for {offer['Employee_Name']} was not accepted. The request from {original_requester} may fail.")
-
-                # Notify the original requester
-                requester_email = employees_df[employees_df['Employee_Name'] == original_requester]['Email'].iloc[0]
-                subject = "Update on Your Absence Request"
-                body = (
-                    f"Hello {original_requester},\n\n"
-                    "Unfortunately, we could not accommodate your absence request for "
-                    f"{failed_request['Start_Date'].iloc[0]} to {failed_request['End_Date'].iloc[0]} "
-                    "because the necessary covering shift changes were declined by other employees.\n\n"
-                    "Your schedule remains unchanged for this period."
-                )
-                # (This would call a simplified email sending function)
-                print(f"--> Notifying {original_requester} that their request failed.")
-    else:
+    if failed_offers.empty:
         print("✅ All offers were accepted. Sandbox is ready for approval.")
+        return sandbox_df # Return the confirmed sandbox
+
+    print(f"Found {len(failed_offers)} declined or expired offers. Reverting changes...")
+
+    # Create a mutable copy of the sandbox to revert changes
+    final_sandbox_df = sandbox_df.copy()
+
+    failed_requesters = set()
+
+    for _, offer in failed_offers.iterrows():
+        original_requester = offer['Requester_Name']
+        failed_requesters.add(original_requester)
+
+        # This is a simplified revert logic. It finds all changes associated with the requester
+        # and reverts them.
+        for day_col in official_schedule_df.columns[1:]:
+             for shift_id in official_schedule_df['Shift']:
+                official_employee = official_schedule_df.loc[official_schedule_df['Shift'] == shift_id, day_col].iloc[0]
+                sandbox_employee = sandbox_df.loc[shift_id, day_col]
+
+                # If this change was caused by the failed request, revert it
+                # A more advanced system would link offers to specific changes
+                if sandbox_employee != official_employee:
+                    final_sandbox_df.loc[shift_id, day_col] = official_employee
+
+    # Batch update the Google Sheet with the reverted schedule
+    sandbox_ws = sheet.worksheet("Sandbox_Schedule")
+    sandbox_ws.update([final_sandbox_df.columns.values.tolist()] + final_sandbox_df.reset_index().values.tolist())
+    print("✅ Sandbox schedule has been updated with reverted changes.")
+
+    # Notify all failed requesters
+    for requester in failed_requesters:
+        print(f"--> Notifying {requester} that their request could not be fulfilled.")
+        # (The email sending logic would be called here)
+
+    return final_sandbox_df
+
+def redistribute_tokens(sheet, requests_df, official_schedule_df, final_sandbox_df):
+    """
+    Redistributes tokens from winners to affected employees or losing bidders.
+    """
+    print("--- Starting Token Redistribution ---")
+
+    employees_ws = sheet.worksheet("Employees")
+    emp_data = employees_ws.get_all_records()
+    token_balances = {row['Employee_Name']: row['Tokens_Official'] for row in emp_data}
+
+    # Identify winners by finding whose OFF request was fulfilled
+    winners = []
+    if not requests_df.empty:
+        for _, request in requests_df.iterrows():
+            emp, day = request['Employee_Name'], pd.to_datetime(request['Start_Date'], dayfirst=True).day
+            day_col = official_schedule_df.columns[day] # Get column name like '2025-09-02 (Tue)'
+
+            # Check if the employee is working in the sandbox on their requested day off
+            is_working = any(final_sandbox_df.loc[shift_id, day_col] == emp for shift_id in final_sandbox_df.index)
+
+            if not is_working:
+                winners.append(request)
+
+    if not winners:
+        print("No winning requests to process for token redistribution.")
+        return
+
+    for winner in winners:
+        winner_name = winner['Employee_Name']
+        tokens_to_distribute = winner['Tokens_Bid']
+        day_of_win = pd.to_datetime(winner['Start_Date'], dayfirst=True).day
+        day_col = official_schedule_df.columns[day_of_win]
+
+        print(f"Processing win for {winner_name} on day {day_of_win}. Tokens to redistribute: {tokens_to_distribute}")
+
+        # Deduct tokens from winner
+        token_balances[winner_name] -= tokens_to_distribute
+
+        # Priority 1: Find employees whose schedule changed on that day
+        changed_employees = []
+        for shift_id in official_schedule_df.index:
+            official_emp = official_schedule_df.loc[shift_id, day_col]
+            sandbox_emp = final_sandbox_df.loc[shift_id, day_col]
+            if official_emp != sandbox_emp:
+                # Someone whose shift was taken away
+                if official_emp and official_emp in token_balances: changed_employees.append(official_emp)
+                # Someone who was newly assigned to a shift
+                if sandbox_emp and sandbox_emp in token_balances: changed_employees.append(sandbox_emp)
+
+        # Remove the winner from the list of changed employees
+        changed_employees = [e for e in set(changed_employees) if e != winner_name]
+
+        if changed_employees:
+            print(f"Distributing tokens to changed employees: {changed_employees}")
+            tokens_per_person = tokens_to_distribute // len(changed_employees)
+            for emp in changed_employees:
+                token_balances[emp] += tokens_per_person
+        else:
+            # Priority 2: No one's schedule changed, find losing bidders for that day
+            losing_bidders = []
+            for _, request in requests_df.iterrows():
+                req_day = pd.to_datetime(request['Start_Date'], dayfirst=True).day
+                # A loser is someone who requested the same day off but isn't the winner
+                if req_day == day_of_win and request['Employee_Name'] != winner_name:
+                    losing_bidders.append(request['Employee_Name'])
+
+            if losing_bidders:
+                print(f"Distributing tokens to losing bidders: {losing_bidders}")
+                tokens_per_person = tokens_to_distribute // len(losing_bidders)
+                for emp in losing_bidders:
+                    token_balances[emp] += tokens_per_person
+
+    # Batch update the token balances in the Google Sheet
+    employees_to_update = employees_ws.col_values(1)
+    cell_updates = []
+    for emp_name, new_balance in token_balances.items():
+        try:
+            row_index = employees_to_update.index(emp_name) + 1
+            # Column D is Tokens_Official, F is Tokens_Sandbox. Let's update both.
+            cell_updates.append(gspread.Cell(row_index, 4, new_balance))
+            cell_updates.append(gspread.Cell(row_index, 6, new_balance))
+        except ValueError:
+            continue
+
+    if cell_updates:
+        employees_ws.update_cells(cell_updates)
+        print("✅ Token balances have been updated in the Google Sheet.")
 
 # --- Main script execution ---
 if __name__ == '__main__':
@@ -462,5 +485,6 @@ if __name__ == '__main__':
 
             process_email_replies(hr_sheet)
 
-            # --- NEW: Final step to act on the replies ---
-            finalize_schedule(hr_sheet, official_schedule_df, sandbox_df, employees_df, requests_df)
+            final_sandbox_df = finalize_schedule(hr_sheet, official_schedule_df, sandbox_df, employees_df, requests_df)
+
+            redistribute_tokens(hr_sheet, requests_df, official_schedule_df, final_sandbox_df)
