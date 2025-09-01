@@ -3,10 +3,17 @@ import sys
 
 if __name__ == '__main__':
     group = None
-    if len(sys.argv) > 1 and sys.argv[1] == '--group':
-        group = sys.argv[2]
+    if '--group' in sys.argv:
+        try:
+            group_index = sys.argv.index('--group') + 1
+            group = sys.argv[group_index]
+        except (ValueError, IndexError):
+            print("Error: --group flag must be followed by a group name.")
+            sys.exit(1)
 
-    scheduler = Scheduler(group=group)
+    is_dry_run = '--dry-run' in sys.argv
+
+    scheduler = Scheduler(group=group, dry_run=is_dry_run)
     if scheduler.sheet:
         solution = scheduler.generate_schedule()
         if solution:

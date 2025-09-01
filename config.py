@@ -14,6 +14,7 @@ HR_EMAIL = 'hr.scheduler@example.com' # The address for sending/receiving offers
 
 # Solver settings
 NUM_PARALLEL_WORKERS = 4
+SOLVER_TIME_LIMIT_SECONDS = 180 # 3 minutes
 
 # --- Column Name Mappings ---
 # This helps if the column names in the Google Sheet change.

@@ -14,8 +14,9 @@ from email.message import EmailMessage
 import config
 
 class Scheduler:
-    def __init__(self, group=None):
+    def __init__(self, group=None, dry_run=False):
         self.group = group
+        self.dry_run = dry_run
         self.sheet = self._connect_to_sheet()
         if self.sheet:
             self.employees_df, self.shifts_df, self.requests_df, self.official_schedule_df, self.sandbox_df = self._read_data()
@@ -61,6 +62,12 @@ class Scheduler:
         sandbox_schedule_df = pd.DataFrame(sandbox_schedule_ws.get_all_records())
 
         return employees_df, shifts_df, requests_df, official_schedule_df, sandbox_schedule_df
+
+    def _read_offers_data(self):
+        """Reads only the Offers tab into a DataFrame."""
+        print("Reading offers data...")
+        offers_ws = self.sheet.worksheet(config.OFFERS_TAB)
+        return pd.DataFrame(offers_ws.get_all_records())
 
     def generate_schedule(self):
         """
@@ -154,6 +161,7 @@ class Scheduler:
 
         solver = cp_model.CpSolver()
         solver.parameters.num_search_workers = config.NUM_PARALLEL_WORKERS
+        solver.parameters.max_time_in_seconds = config.SOLVER_TIME_LIMIT_SECONDS
         status = solver.Solve(model)
 
         if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -242,7 +250,7 @@ class Scheduler:
 
             email_body = (
                 f"Hello {employee_name},\n\n"
-            f"To accommodate a request from {requester_name}, you are being offered a reward of {token_reward} tokens to accept the following schedule change (first come, first served):\n\n"
+            f"To accommodate a request from {requester_name}, you are being offered a reward of {token_reward} tokens to accept the following schedule change. This reward will be given to the first employee who accepts.\n\n"
                 + "\n".join(f"- {change}" for change in changes_list)
                 + f"\n\nPlease click to accept or decline:\n"
                 f"✅ Accept: {accept_link}\n"
@@ -250,43 +258,35 @@ class Scheduler:
                 f"This offer is valid for 1 hour. Offer ID: {offer_id}"
             )
 
-            msg = EmailMessage()
-            msg.set_content(email_body)
-            msg['Subject'] = 'Schedule Change Proposal'
-            msg['From'] = sender_email
-            msg['To'] = recipient_email
+            self._send_email(recipient_email, 'Schedule Change Proposal', email_body)
+            expiry_time = (datetime.now() + timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
+            offers_to_log.append([offer_id, employee_name, "PENDING", expiry_time, requester_name])
 
-            try:
-                server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
-                server.login(sender_email, app_password)
-                server.send_message(msg)
-                server.quit()
-                print(f"✅ Offer email sent to {employee_name} ({recipient_email}) for Offer ID {offer_id}")
-
-                expiry_time = (datetime.now() + timedelta(hours=1)).strftime('%Y-%m-%d %H:%M:%S')
-                offers_to_log.append([offer_id, employee_name, "PENDING", expiry_time, requester_name])
-
-            except Exception as e:
-                print(f"❌ Failed to send offer email to {employee_name}: {e}")
-
-        if offers_to_log:
+        if offers_to_log and not self.dry_run:
             offers_ws.append_rows(offers_to_log)
             print(f"✅ Logged {len(offers_to_log)} new offers to the 'Offers' tab.")
+        elif offers_to_log:
+            print(f"DRY RUN: Would have logged {len(offers_to_log)} new offers.")
 
-        sandbox_ws = self.sheet.worksheet(config.SANDBOX_SCHEDULE_TAB)
-        sandbox_ws.update([sandbox_df.columns.values.tolist()] + sandbox_df.reset_index().values.tolist())
-        print("✅ Sandbox_Schedule tab has been updated.")
+        if not self.dry_run:
+            sandbox_ws = self.sheet.worksheet(config.SANDBOX_SCHEDULE_TAB)
+            sandbox_ws.update([sandbox_df.columns.values.tolist()] + sandbox_df.reset_index().values.tolist())
+            print("✅ Sandbox_Schedule tab has been updated.")
+        else:
+            print("DRY RUN: Would have updated the Sandbox_Schedule tab.")
 
         return sandbox_df
 
     def process_email_replies(self):
         print("--- Processing Email Replies ---")
+        accepted_count = 0
+        declined_count = 0
         try:
             hr_email = os.environ.get('GMAIL_ADDRESS')
             app_password = os.environ.get('GMAIL_APP_PASSWORD')
             if not hr_email or not app_password:
                 print("❌ HR Email credentials not found. Cannot process replies.")
-                return
+                return 0, 0
 
             offers_ws = self.sheet.worksheet(config.OFFERS_TAB)
 
@@ -306,16 +306,33 @@ class Scheduler:
 
                 try:
                     response, offer_id = subject.split('-')
+                    if response.upper() == 'ACCEPT':
+                        accepted_count += 1
+                    elif response.upper() == 'DECLINE':
+                        declined_count += 1
+
                     cell = offers_ws.find(offer_id)
                     if cell:
-                        offers_ws.update_cell(cell.row, 4, response.upper())
+                        if not self.dry_run:
+                            offers_ws.update_cell(cell.row, 4, response.upper())
+                            mail.store(num, '+FLAGS', '\\Seen')
+
                         print(f"✅ Processed reply for Offer {offer_id}. Status set to {response.upper()}.")
-                        mail.store(num, '+FLAGS', '\\Seen')
-                except Exception as e:
-                    print(f"⚠️ Could not parse subject: '{subject}'. Error: {e}")
+
+                        # Send confirmation email
+                        employee_name = offers_ws.cell(cell.row, 2).value
+                        employee_email = self.employees_df[self.employees_df[config.COL_EMPLOYEE_NAME] == employee_name][config.COL_EMPLOYEE_EMAIL].iloc[0]
+                        confirmation_subject = "Your Response Has Been Recorded"
+                        confirmation_body = f"Thank you, your response ('{response.upper()}') for Offer ID {offer_id} has been successfully recorded."
+                        self._send_email(employee_email, confirmation_subject, confirmation_body)
+                except ValueError:
+                    print(f"⚠️ Could not parse subject: '{subject}'. Skipping.")
+                    continue
 
         except Exception as e:
             print(f"❌ An error occurred while processing email replies: {e}")
+
+        return accepted_count, declined_count
 
     def finalize_schedule(self, sandbox_df):
         print("--- Finalizing Sandbox Schedule Based on Responses ---")
@@ -346,12 +363,17 @@ class Scheduler:
                     if sandbox_employee != official_employee:
                         final_sandbox_df.loc[shift_id, day_col] = official_employee
 
-        sandbox_ws = self.sheet.worksheet(config.SANDBOX_SCHEDULE_TAB)
-        sandbox_ws.update([final_sandbox_df.columns.values.tolist()] + final_sandbox_df.reset_index().values.tolist())
-        print("✅ Sandbox schedule has been updated with reverted changes.")
+        if not self.dry_run:
+            sandbox_ws = self.sheet.worksheet(config.SANDBOX_SCHEDULE_TAB)
+            sandbox_ws.update([final_sandbox_df.columns.values.tolist()] + final_sandbox_df.reset_index().values.tolist())
+            print("✅ Sandbox schedule has been updated with reverted changes.")
+        else:
+            print("DRY RUN: Would have updated the Sandbox_Schedule tab with reverted changes.")
 
         for requester in failed_requesters:
             print(f"--> Notifying {requester} that their request could not be fulfilled.")
+            # In a real implementation, an email would be sent here.
+            # This would also be wrapped in `if not self.dry_run:`.
 
         return final_sandbox_df
 
@@ -414,6 +436,49 @@ class Scheduler:
             except ValueError:
                 continue
 
-        if cell_updates:
+        if cell_updates and not self.dry_run:
             employees_ws.update_cells(cell_updates)
             print("✅ Token balances have been updated in the Google Sheet.")
+        elif cell_updates:
+            print("DRY RUN: Would have updated token balances in the Google Sheet.")
+
+    def _send_email(self, recipient_email, subject, body):
+        """A helper function to send emails."""
+        sender_email = os.environ.get('GMAIL_ADDRESS')
+        app_password = os.environ.get('GMAIL_APP_PASSWORD')
+        if not sender_email or not app_password:
+            print("❌ Email credentials not found. Cannot send email.")
+            return False
+
+        if self.dry_run:
+            print(f"DRY RUN: Would send email to {recipient_email} with subject '{subject}'.")
+            return True
+
+        msg = EmailMessage()
+        msg.set_content(body)
+        msg['Subject'] = subject
+        msg['From'] = sender_email
+        msg['To'] = recipient_email
+
+        try:
+            server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
+            server.login(sender_email, app_password)
+            server.send_message(msg)
+            server.quit()
+            print(f"✅ Email sent successfully to {recipient_email}.")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to send email to {recipient_email}: {e}")
+            return False
+
+    def send_hr_summary(self, accepted_count, declined_count):
+        print("--- Sending HR Summary Email ---")
+        hr_email = config.HR_EMAIL
+        subject = "Hourly Schedule Run Summary"
+        body = (
+            f"The hourly reply processing is complete.\n\n"
+            f"- {accepted_count} offers were accepted.\n"
+            f"- {declined_count} offers were declined.\n\n"
+            "The Sandbox schedule is now finalized and ready for your one-click approval."
+        )
+        self._send_email(hr_email, subject, body)
