@@ -4,9 +4,9 @@ name: Daily HR Schedule Offer Run
 # Controls when the workflow will run
 on:
   # Runs on a schedule (cron job)
-  schedule:
-    # This is for 17:00 CEST (15:00 UTC) every day
-    - cron: '0 15 * * *'
+  # schedule:
+  #   # This is for 17:00 CEST (15:00 UTC) every day
+  #   - cron: '0 15 * * *'
   # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
 
